@@ -37,15 +37,26 @@ class AppDelegate: NSObject, NSApplicationDelegate {
 
         let menu = NSMenu()
 
-        let char1Item = NSMenuItem(title: "Bruce", action: #selector(toggleChar1), keyEquivalent: "1")
+        let char1Item = NSMenuItem(title: "AXO", action: #selector(toggleChar1), keyEquivalent: "1")
         char1Item.state = .on
         menu.addItem(char1Item)
 
-        let char2Item = NSMenuItem(title: "Jazz", action: #selector(toggleChar2), keyEquivalent: "2")
+        let char2Item = NSMenuItem(title: "Mudbug", action: #selector(toggleChar2), keyEquivalent: "2")
         char2Item.state = .on
         menu.addItem(char2Item)
 
         menu.addItem(NSMenuItem.separator())
+
+        let providerItem = NSMenuItem(title: "AI Provider", action: nil, keyEquivalent: "")
+        let providerMenu = NSMenu()
+        for provider in AgentProvider.allCases {
+            let item = NSMenuItem(title: provider.menuTitle, action: #selector(switchProvider(_:)), keyEquivalent: "")
+            item.representedObject = provider.rawValue
+            item.state = provider == AgentProvider.current ? .on : .off
+            providerMenu.addItem(item)
+        }
+        providerItem.submenu = providerMenu
+        menu.addItem(providerItem)
 
         let soundItem = NSMenuItem(title: "Sounds", action: #selector(toggleSounds(_:)), keyEquivalent: "")
         soundItem.state = .on
@@ -139,6 +150,22 @@ class AppDelegate: NSObject, NSApplicationDelegate {
                 item.state = item.tag == idx ? .on : .off
             }
         }
+    }
+
+    @objc func switchProvider(_ sender: NSMenuItem) {
+        guard let raw = sender.representedObject as? String,
+              let provider = AgentProvider(rawValue: raw) else { return }
+
+        AgentProvider.setCurrent(provider)
+
+        if let providerMenu = sender.menu {
+            for item in providerMenu.items {
+                let isSelected = (item.representedObject as? String) == provider.rawValue
+                item.state = isSelected ? .on : .off
+            }
+        }
+
+        controller?.characters.forEach { $0.resetSessionForProviderChange() }
     }
 
     @objc func toggleChar1(_ sender: NSMenuItem) {

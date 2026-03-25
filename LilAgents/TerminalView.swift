@@ -52,6 +52,9 @@ class TerminalView: NSView {
     let textView = NSTextView()
     let inputField = NSTextField()
     var onSendMessage: ((String) -> Void)?
+    var placeholderText = "Ask your agent..." {
+        didSet { updatePlaceholder() }
+    }
 
     private var currentAssistantText = ""
     private var isStreaming = false
@@ -134,14 +137,11 @@ class TerminalView: NSView {
         paddedCell.isBezeled = false
         paddedCell.fieldBackgroundColor = nil
         paddedCell.fieldCornerRadius = 0
-        paddedCell.placeholderAttributedString = NSAttributedString(
-            string: "Ask Claude...",
-            attributes: [.font: t.font, .foregroundColor: t.textDim]
-        )
         inputField.cell = paddedCell
         inputField.target = self
         inputField.action = #selector(inputSubmitted)
         addSubview(inputField)
+        updatePlaceholder()
     }
 
     // MARK: - Input
@@ -270,6 +270,15 @@ class TerminalView: NSView {
 
     private func scrollToBottom() {
         textView.scrollToEndOfDocument(nil)
+    }
+
+    private func updatePlaceholder() {
+        guard let cell = inputField.cell as? PaddedTextFieldCell else { return }
+        let t = theme
+        cell.placeholderAttributedString = NSAttributedString(
+            string: placeholderText,
+            attributes: [.font: t.font, .foregroundColor: t.textDim]
+        )
     }
 
     // MARK: - Markdown Rendering

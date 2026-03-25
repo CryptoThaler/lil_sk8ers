@@ -54,6 +54,7 @@ class WalkerCharacter {
     var themeOverride: PopoverTheme?
     var isClaudeBusy: Bool { claudeSession?.isBusy ?? false }
     var thinkingBubbleWindow: NSWindow?
+    var activeProvider: AgentProvider { AgentProvider.current }
 
     init(videoName: String) {
         self.videoName = videoName
@@ -133,15 +134,15 @@ class WalkerCharacter {
             createPopoverWindow()
         }
 
-        // Show static welcome message instead of Claude terminal
+        // Show static welcome copy instead of the live terminal
         terminalView?.inputField.isEditable = false
-        terminalView?.inputField.placeholderString = ""
+        terminalView?.placeholderText = ""
         let welcome = """
-        hey! we're bruce and jazz — your lil dock agents.
+        hey! we're AXO and Mudbug — your lil dock skaters.
 
-        click either of us to open a Claude AI chat. we'll walk around while you work and let you know when Claude's thinking.
+        click either of us to open an AI chat. we'll skate around while you work and let you know when your assistant is thinking.
 
-        check the menu bar icon (top right) for themes, sounds, and more options.
+        use the menu bar icon (top right) to switch between Claude Code and OpenAI, plus themes, sounds, and display options.
 
         click anywhere outside to dismiss, then click us again to start chatting.
         """
@@ -193,8 +194,13 @@ class WalkerCharacter {
         showingCompletion = false
         hideBubble()
 
+        if let existing = claudeSession, existing.provider != activeProvider {
+            existing.terminate()
+            claudeSession = nil
+        }
+
         if claudeSession == nil {
-            let session = ClaudeSession()
+            let session = ClaudeSession(provider: activeProvider)
             claudeSession = session
             wireSession(session)
             session.start()
@@ -317,6 +323,13 @@ class WalkerCharacter {
         titleLabel.frame = NSRect(x: 12, y: 6, width: 200, height: 16)
         titleBar.addSubview(titleLabel)
 
+        let providerLabel = NSTextField(labelWithString: activeProvider.badgeTitle)
+        providerLabel.font = NSFont.monospacedSystemFont(ofSize: 10, weight: .semibold)
+        providerLabel.textColor = t.textDim
+        providerLabel.alignment = .right
+        providerLabel.frame = NSRect(x: popoverWidth - 120, y: 6, width: 104, height: 16)
+        titleBar.addSubview(providerLabel)
+
         let sep = NSView(frame: NSRect(x: 0, y: popoverHeight - 29, width: popoverWidth, height: 1))
         sep.wantsLayer = true
         sep.layer?.backgroundColor = t.separatorColor.cgColor
@@ -325,6 +338,7 @@ class WalkerCharacter {
         let terminal = TerminalView(frame: NSRect(x: 0, y: 0, width: popoverWidth, height: popoverHeight - 29))
         terminal.characterColor = characterColor
         terminal.themeOverride = themeOverride
+        terminal.placeholderText = activeProvider.placeholder
         terminal.autoresizingMask = [.width, .height]
         terminal.onSendMessage = { [weak self] message in
             self?.claudeSession?.send(message: message)
@@ -364,7 +378,31 @@ class WalkerCharacter {
 
         session.onProcessExit = { [weak self] in
             self?.terminalView?.endStreaming()
-            self?.terminalView?.appendError("Claude session ended.")
+            self?.terminalView?.appendError("\(session.provider.menuTitle) session ended.")
+        }
+    }
+
+    func resetSessionForProviderChange() {
+        claudeSession?.terminate()
+        claudeSession = nil
+        currentStreamingText = ""
+
+        guard isIdleForPopover else {
+            popoverWindow = nil
+            terminalView = nil
+            return
+        }
+
+        popoverWindow?.orderOut(nil)
+        popoverWindow = nil
+        terminalView = nil
+        createPopoverWindow()
+        updatePopoverPosition()
+        popoverWindow?.orderFrontRegardless()
+        popoverWindow?.makeKey()
+
+        if let terminal = terminalView {
+            popoverWindow?.makeFirstResponder(terminal.inputField)
         }
     }
 

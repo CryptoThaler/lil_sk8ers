@@ -1,20 +1,140 @@
 import Foundation
 
-class ClaudeSession {
+enum AgentProvider: String, CaseIterable {
+    case claudeCode = "claude_code"
+    case openAICodex = "openai_codex"
+
+    static let defaultsKey = "selectedProvider"
+
+    var menuTitle: String {
+        switch self {
+        case .claudeCode:
+            return "Claude Code"
+        case .openAICodex:
+            return "OpenAI (Codex)"
+        }
+    }
+
+    var badgeTitle: String {
+        switch self {
+        case .claudeCode:
+            return "CLAUDE"
+        case .openAICodex:
+            return "OPENAI"
+        }
+    }
+
+    var placeholder: String {
+        switch self {
+        case .claudeCode:
+            return "Ask Claude Code..."
+        case .openAICodex:
+            return "Ask OpenAI..."
+        }
+    }
+
+    var missingInstallMessage: String {
+        switch self {
+        case .claudeCode:
+            return """
+            Claude Code CLI not found.
+
+            To install, run this in Terminal:
+              curl -fsSL https://claude.ai/install.sh | sh
+
+            Or download from https://claude.ai/download
+            """
+        case .openAICodex:
+            return """
+            OpenAI Codex CLI not found.
+
+            Make sure `codex` is installed and available on your shell PATH.
+            """
+        }
+    }
+
+    var launchFailureMessage: String {
+        switch self {
+        case .claudeCode:
+            return """
+            Failed to launch Claude Code CLI.
+
+            Make sure Claude Code is installed and up to date:
+              curl -fsSL https://claude.ai/install.sh | sh
+            """
+        case .openAICodex:
+            return """
+            Failed to launch OpenAI Codex CLI.
+
+            Make sure `codex` is installed and authenticated.
+            """
+        }
+    }
+
+    var executableName: String {
+        switch self {
+        case .claudeCode:
+            return "claude"
+        case .openAICodex:
+            return "codex"
+        }
+    }
+
+    var fallbackPaths: [String] {
+        let home = FileManager.default.homeDirectoryForCurrentUser.path
+        switch self {
+        case .claudeCode:
+            return [
+                "\(home)/.local/bin/claude",
+                "\(home)/.claude/local/bin/claude",
+                "/usr/local/bin/claude",
+                "/opt/homebrew/bin/claude"
+            ]
+        case .openAICodex:
+            return [
+                "\(home)/.local/bin/codex",
+                "/usr/local/bin/codex",
+                "/opt/homebrew/bin/codex"
+            ]
+        }
+    }
+
+    static var current: AgentProvider {
+        guard let raw = UserDefaults.standard.string(forKey: defaultsKey),
+              let provider = AgentProvider(rawValue: raw) else {
+            return .claudeCode
+        }
+        return provider
+    }
+
+    static func setCurrent(_ provider: AgentProvider) {
+        UserDefaults.standard.set(provider.rawValue, forKey: defaultsKey)
+    }
+}
+
+final class AgentSession {
     private var process: Process?
     private var inputPipe: Pipe?
     private var outputPipe: Pipe?
     private var errorPipe: Pipe?
     private var lineBuffer = ""
+    private var pendingMessages: [String] = []
+    private var codexStderr = ""
+    private var resolvedCLIPath: String?
     private(set) var isRunning = false
-    private(set) var isBusy = false  // true between send() and result
-    private static var claudePath: String?
-    private static var shellEnvironment: [String: String]?
+    private(set) var isBusy = false
+    private var isStarting = false
+    private var isReadyForMessages = false
+
+    static private var resolvedPaths: [AgentProvider: String] = [:]
+    static private var shellEnvironment: [String: String]?
+
+    let provider: AgentProvider
 
     var onText: ((String) -> Void)?
     var onError: ((String) -> Void)?
-    var onToolUse: ((String, [String: Any]) -> Void)?    // toolName, input
-    var onToolResult: ((String, Bool) -> Void)?           // summary, isError
+    var onToolUse: ((String, [String: Any]) -> Void)?
+    var onToolResult: ((String, Bool) -> Void)?
     var onSessionReady: (() -> Void)?
     var onTurnComplete: (() -> Void)?
     var onProcessExit: (() -> Void)?
@@ -26,19 +146,20 @@ class ClaudeSession {
     }
     var history: [Message] = []
 
+    init(provider: AgentProvider = AgentProvider.current) {
+        self.provider = provider
+    }
+
     // MARK: - Process Lifecycle
 
-    static func resolveClaudePath(completion: @escaping (String?) -> Void) {
-        if let cached = claudePath, shellEnvironment != nil {
-            completion(cached)
+    static private func captureShellEnvironment(completion: @escaping ([String: String]) -> Void) {
+        if let env = shellEnvironment {
+            completion(env)
             return
         }
-        // Always capture the user's login shell environment first.
-        // This is critical: Xcode's process environment has a minimal PATH that won't
-        // include ~/.local/bin, /opt/homebrew/bin, nvm paths, etc.
+
         let proc = Process()
         proc.executableURL = URL(fileURLWithPath: "/bin/zsh")
-        // Use -i (interactive) AND -l (login) to ensure .zshrc and .zprofile are both loaded
         proc.arguments = ["-l", "-i", "-c", "echo '---ENV_START---' && env && echo '---ENV_END---'"]
         let pipe = Pipe()
         proc.standardOutput = pipe
@@ -47,89 +168,90 @@ class ClaudeSession {
             let data = pipe.fileHandleForReading.readDataToEndOfFile()
             let output = String(data: data, encoding: .utf8) ?? ""
             DispatchQueue.main.async {
-                // Parse shell environment
+                var env: [String: String] = ProcessInfo.processInfo.environment
                 if let startRange = output.range(of: "---ENV_START---\n"),
                    let endRange = output.range(of: "\n---ENV_END---") {
                     let envString = String(output[startRange.upperBound..<endRange.lowerBound])
-                    var env: [String: String] = [:]
                     for line in envString.components(separatedBy: "\n") {
-                        if let eqRange = line.range(of: "=") {
-                            let key = String(line[line.startIndex..<eqRange.lowerBound])
-                            let value = String(line[eqRange.upperBound...])
-                            env[key] = value
-                        }
-                    }
-                    shellEnvironment = env
-                }
-
-                // Now find claude: check the shell PATH first, then fallback locations
-                let home = FileManager.default.homeDirectoryForCurrentUser.path
-                let searchPaths = [
-                    "\(home)/.local/bin/claude",
-                    "\(home)/.claude/local/bin/claude",
-                    "/usr/local/bin/claude",
-                    "/opt/homebrew/bin/claude"
-                ]
-
-                // Check if claude is in the captured shell PATH
-                if let shellPath = shellEnvironment?["PATH"] {
-                    for dir in shellPath.components(separatedBy: ":") {
-                        let candidate = "\(dir)/claude"
-                        if FileManager.default.isExecutableFile(atPath: candidate) {
-                            claudePath = candidate
-                            completion(candidate)
-                            return
-                        }
+                        guard let eqRange = line.range(of: "=") else { continue }
+                        let key = String(line[line.startIndex..<eqRange.lowerBound])
+                        let value = String(line[eqRange.upperBound...])
+                        env[key] = value
                     }
                 }
+                shellEnvironment = env
+                completion(env)
+            }
+        }
 
-                // Fallback: check common install locations directly
-                for fallback in searchPaths {
-                    if FileManager.default.isExecutableFile(atPath: fallback) {
-                        claudePath = fallback
-                        completion(fallback)
+        do {
+            try proc.run()
+        } catch {
+            let env = ProcessInfo.processInfo.environment
+            shellEnvironment = env
+            completion(env)
+        }
+    }
+
+    static func resolveCLIPath(for provider: AgentProvider, completion: @escaping (String?) -> Void) {
+        if let cached = resolvedPaths[provider], shellEnvironment != nil {
+            completion(cached)
+            return
+        }
+
+        captureShellEnvironment { env in
+            if let shellPath = env["PATH"] {
+                for dir in shellPath.components(separatedBy: ":") where !dir.isEmpty {
+                    let candidate = "\(dir)/\(provider.executableName)"
+                    if FileManager.default.isExecutableFile(atPath: candidate) {
+                        resolvedPaths[provider] = candidate
+                        completion(candidate)
                         return
                     }
                 }
+            }
 
-                completion(nil)
+            for fallback in provider.fallbackPaths where FileManager.default.isExecutableFile(atPath: fallback) {
+                resolvedPaths[provider] = fallback
+                completion(fallback)
+                return
             }
-        }
-        do { try proc.run() } catch {
-            // If shell fails entirely, still try fallback paths
-            let home = FileManager.default.homeDirectoryForCurrentUser.path
-            let fallbacks = [
-                "\(home)/.local/bin/claude",
-                "\(home)/.claude/local/bin/claude",
-                "/usr/local/bin/claude",
-                "/opt/homebrew/bin/claude"
-            ]
-            for fallback in fallbacks {
-                if FileManager.default.isExecutableFile(atPath: fallback) {
-                    claudePath = fallback
-                    completion(fallback)
-                    return
-                }
-            }
+
             completion(nil)
         }
     }
 
     func start() {
-        ClaudeSession.resolveClaudePath { [weak self] path in
-            guard let self = self, let claudePath = path else {
-                let msg = "Claude CLI not found.\n\nTo install, run this in Terminal:\n  curl -fsSL https://claude.ai/install.sh | sh\n\nOr download from https://claude.ai/download"
-                self?.onError?(msg)
-                self?.history.append(Message(role: .error, text: msg))
+        guard !isRunning, !isStarting else { return }
+        isStarting = true
+
+        AgentSession.resolveCLIPath(for: provider) { [weak self] path in
+            guard let self = self else { return }
+            self.isStarting = false
+
+            guard let cliPath = path else {
+                self.pendingMessages.removeAll()
+                self.handleError(self.provider.missingInstallMessage)
                 return
             }
-            self.launchProcess(claudePath: claudePath)
+
+            self.resolvedCLIPath = cliPath
+
+            switch self.provider {
+            case .claudeCode:
+                self.launchClaudeProcess(cliPath)
+            case .openAICodex:
+                self.isRunning = true
+                self.isReadyForMessages = true
+                self.onSessionReady?()
+                self.flushPendingMessagesIfPossible()
+            }
         }
     }
 
-    private func launchProcess(claudePath: String) {
+    private func launchClaudeProcess(_ cliPath: String) {
         let proc = Process()
-        proc.executableURL = URL(fileURLWithPath: claudePath)
+        proc.executableURL = URL(fileURLWithPath: cliPath)
         proc.arguments = [
             "-p",
             "--output-format", "stream-json",
@@ -138,25 +260,7 @@ class ClaudeSession {
             "--dangerously-skip-permissions"
         ]
         proc.currentDirectoryURL = FileManager.default.homeDirectoryForCurrentUser
-
-        // Use the shell environment captured from the user's login shell, not Xcode's
-        // process environment. Xcode strips PATH and other vars that Claude CLI needs.
-        var env = ClaudeSession.shellEnvironment ?? ProcessInfo.processInfo.environment
-        // Ensure PATH always includes common locations even if shell capture failed
-        let home = FileManager.default.homeDirectoryForCurrentUser.path
-        let essentialPaths = [
-            "\(home)/.local/bin",
-            "\(home)/.local/share/claude/versions",
-            "/usr/local/bin",
-            "/opt/homebrew/bin"
-        ]
-        let currentPath = env["PATH"] ?? "/usr/bin:/bin"
-        let missingPaths = essentialPaths.filter { !currentPath.contains($0) }
-        if !missingPaths.isEmpty {
-            env["PATH"] = (missingPaths + [currentPath]).joined(separator: ":")
-        }
-        env["TERM"] = "dumb"
-        proc.environment = env
+        proc.environment = sessionEnvironment()
 
         let inPipe = Pipe()
         let outPipe = Pipe()
@@ -169,6 +273,7 @@ class ClaudeSession {
             DispatchQueue.main.async {
                 self?.isRunning = false
                 self?.isBusy = false
+                self?.isReadyForMessages = false
                 self?.onProcessExit?()
             }
         }
@@ -178,7 +283,7 @@ class ClaudeSession {
             guard !data.isEmpty else { return }
             if let text = String(data: data, encoding: .utf8) {
                 DispatchQueue.main.async {
-                    self?.processOutput(text)
+                    self?.processClaudeOutput(text)
                 }
             }
         }
@@ -188,7 +293,7 @@ class ClaudeSession {
             guard !data.isEmpty else { return }
             if let text = String(data: data, encoding: .utf8) {
                 DispatchQueue.main.async {
-                    self?.onError?(text)
+                    self?.handleError(text)
                 }
             }
         }
@@ -201,16 +306,40 @@ class ClaudeSession {
             errorPipe = errPipe
             isRunning = true
         } catch {
-            let msg = "Failed to launch Claude CLI.\n\nMake sure Claude Code is installed and up to date:\n  curl -fsSL https://claude.ai/install.sh | sh\n\nError: \(error.localizedDescription)"
-            onError?(msg)
-            history.append(Message(role: .error, text: msg))
+            let msg = "\(provider.launchFailureMessage)\n\nError: \(error.localizedDescription)"
+            handleError(msg)
         }
     }
 
     func send(message: String) {
-        guard isRunning, let pipe = inputPipe else { return }
+        let trimmed = message.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !trimmed.isEmpty else { return }
+
+        guard isRunning, isReadyForMessages, !isBusy else {
+            pendingMessages.append(trimmed)
+            if !isRunning, !isStarting {
+                start()
+            }
+            return
+        }
+
         isBusy = true
-        history.append(Message(role: .user, text: message))
+        history.append(Message(role: .user, text: trimmed))
+
+        switch provider {
+        case .claudeCode:
+            sendToClaude(trimmed)
+        case .openAICodex:
+            sendToCodex()
+        }
+    }
+
+    private func sendToClaude(_ message: String) {
+        guard let pipe = inputPipe else {
+            isBusy = false
+            pendingMessages.insert(message, at: 0)
+            return
+        }
 
         let payload: [String: Any] = [
             "type": "user",
@@ -219,31 +348,149 @@ class ClaudeSession {
                 "content": message
             ]
         ]
+
         guard let data = try? JSONSerialization.data(withJSONObject: payload),
-              let jsonStr = String(data: data, encoding: .utf8) else { return }
-        let line = jsonStr + "\n"
-        pipe.fileHandleForWriting.write(line.data(using: .utf8)!)
+              let jsonStr = String(data: data, encoding: .utf8) else {
+            isBusy = false
+            return
+        }
+
+        pipe.fileHandleForWriting.write((jsonStr + "\n").data(using: .utf8)!)
+    }
+
+    private func sendToCodex() {
+        guard let cliPath = resolvedCLIPath else {
+            isBusy = false
+            handleError(provider.missingInstallMessage)
+            return
+        }
+
+        codexStderr = ""
+        let outputURL = FileManager.default.temporaryDirectory.appendingPathComponent("lil-agents-codex-\(UUID().uuidString).txt")
+        let proc = Process()
+        proc.executableURL = URL(fileURLWithPath: cliPath)
+        proc.arguments = [
+            "exec",
+            "--skip-git-repo-check",
+            "--sandbox", "read-only",
+            "--color", "never",
+            "--output-last-message", outputURL.path,
+            buildCodexPrompt()
+        ]
+        proc.currentDirectoryURL = FileManager.default.homeDirectoryForCurrentUser
+        proc.environment = sessionEnvironment(extra: [
+            "NO_COLOR": "1",
+            "CLICOLOR": "0",
+            "OTEL_SDK_DISABLED": "true"
+        ])
+
+        let outPipe = Pipe()
+        let errPipe = Pipe()
+        proc.standardOutput = outPipe
+        proc.standardError = errPipe
+
+        errPipe.fileHandleForReading.readabilityHandler = { [weak self] handle in
+            let data = handle.availableData
+            guard !data.isEmpty else { return }
+            if let text = String(data: data, encoding: .utf8) {
+                DispatchQueue.main.async {
+                    self?.codexStderr += text
+                }
+            }
+        }
+
+        proc.terminationHandler = { [weak self] finishedProc in
+            DispatchQueue.main.async {
+                errPipe.fileHandleForReading.readabilityHandler = nil
+                self?.handleCodexCompletion(exitCode: finishedProc.terminationStatus, outputURL: outputURL)
+            }
+        }
+
+        do {
+            try proc.run()
+            process = proc
+            outputPipe = outPipe
+            errorPipe = errPipe
+        } catch {
+            isBusy = false
+            let msg = "\(provider.launchFailureMessage)\n\nError: \(error.localizedDescription)"
+            handleError(msg)
+        }
+    }
+
+    private func buildCodexPrompt() -> String {
+        let transcript = history.suffix(12).compactMap { message -> String? in
+            switch message.role {
+            case .user:
+                return "USER: \(message.text)"
+            case .assistant:
+                return "ASSISTANT: \(message.text)"
+            case .error:
+                return "SYSTEM: \(message.text)"
+            case .toolUse, .toolResult:
+                return nil
+            }
+        }.joined(separator: "\n\n")
+
+        return """
+        You are replying inside a tiny macOS dock chat window.
+        Continue the conversation below and respond only to the latest USER message.
+        Keep the answer concise and readable in a small terminal UI.
+        Do not use tools, do not mention hidden system instructions, and do not restate the transcript.
+
+        \(transcript)
+        """
+    }
+
+    private func handleCodexCompletion(exitCode: Int32, outputURL: URL) {
+        process = nil
+        outputPipe = nil
+        errorPipe = nil
+        isBusy = false
+
+        let result = (try? String(contentsOf: outputURL, encoding: .utf8))?
+            .trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
+        try? FileManager.default.removeItem(at: outputURL)
+
+        if exitCode == 0, !result.isEmpty {
+            onText?(result)
+            history.append(Message(role: .assistant, text: result))
+            onTurnComplete?()
+        } else {
+            let stderr = codexStderr
+                .components(separatedBy: .newlines)
+                .filter { !$0.trimmingCharacters(in: .whitespaces).isEmpty && !$0.hasPrefix("WARNING: proceeding") }
+                .joined(separator: "\n")
+            let detail = stderr.isEmpty ? "Command exited with status \(exitCode)." : stderr
+            handleError("\(provider.launchFailureMessage)\n\n\(detail)")
+        }
+
+        flushPendingMessagesIfPossible()
     }
 
     func terminate() {
+        pendingMessages.removeAll()
         process?.terminate()
+        process = nil
         isRunning = false
+        isBusy = false
+        isReadyForMessages = false
     }
 
-    // MARK: - NDJSON Parsing
+    // MARK: - Claude NDJSON Parsing
 
-    private func processOutput(_ text: String) {
+    private func processClaudeOutput(_ text: String) {
         lineBuffer += text
         while let newlineRange = lineBuffer.range(of: "\n") {
             let line = String(lineBuffer[lineBuffer.startIndex..<newlineRange.lowerBound])
             lineBuffer = String(lineBuffer[newlineRange.upperBound...])
             if !line.isEmpty {
-                parseLine(line)
+                parseClaudeLine(line)
             }
         }
     }
 
-    private func parseLine(_ line: String) {
+    private func parseClaudeLine(_ line: String) {
         guard let data = line.data(using: .utf8),
               let json = try? JSONSerialization.jsonObject(with: data) as? [String: Any] else { return }
 
@@ -253,7 +500,9 @@ class ClaudeSession {
         case "system":
             let subtype = json["subtype"] as? String ?? ""
             if subtype == "init" {
+                isReadyForMessages = true
                 onSessionReady?()
+                flushPendingMessagesIfPossible()
             }
 
         case "assistant":
@@ -276,29 +525,25 @@ class ClaudeSession {
         case "user":
             if let message = json["message"] as? [String: Any],
                let content = message["content"] as? [[String: Any]] {
-                for block in content {
-                    if block["type"] as? String == "tool_result" {
-                        let isError = block["is_error"] as? Bool ?? false
-                        var summary = ""
-                        if let resultInfo = json["tool_use_result"] as? [String: Any] {
-                            if let text = resultInfo["type"] as? String, text == "text" {
-                                if let file = resultInfo["file"] as? [String: Any],
-                                   let path = file["filePath"] as? String {
-                                    let lines = file["totalLines"] as? Int ?? 0
-                                    summary = "\(path) (\(lines) lines)"
-                                }
-                            }
-                        } else if let resultStr = json["tool_use_result"] as? String {
-                            summary = String(resultStr.prefix(80))
-                        }
-                        if summary.isEmpty {
-                            if let contentStr = block["content"] as? String {
-                                summary = String(contentStr.prefix(80))
+                for block in content where block["type"] as? String == "tool_result" {
+                    let isError = block["is_error"] as? Bool ?? false
+                    var summary = ""
+                    if let resultInfo = json["tool_use_result"] as? [String: Any] {
+                        if let text = resultInfo["type"] as? String, text == "text" {
+                            if let file = resultInfo["file"] as? [String: Any],
+                               let path = file["filePath"] as? String {
+                                let lines = file["totalLines"] as? Int ?? 0
+                                summary = "\(path) (\(lines) lines)"
                             }
                         }
-                        history.append(Message(role: .toolResult, text: isError ? "ERROR: \(summary)" : summary))
-                        onToolResult?(summary, isError)
+                    } else if let resultStr = json["tool_use_result"] as? String {
+                        summary = String(resultStr.prefix(80))
                     }
+                    if summary.isEmpty, let contentStr = block["content"] as? String {
+                        summary = String(contentStr.prefix(80))
+                    }
+                    history.append(Message(role: .toolResult, text: isError ? "ERROR: \(summary)" : summary))
+                    onToolResult?(summary, isError)
                 }
             }
 
@@ -308,6 +553,7 @@ class ClaudeSession {
                 history.append(Message(role: .assistant, text: result))
             }
             onTurnComplete?()
+            flushPendingMessagesIfPossible()
 
         default:
             break
@@ -331,4 +577,38 @@ class ClaudeSession {
             return input.keys.sorted().prefix(3).joined(separator: ", ")
         }
     }
+
+    private func sessionEnvironment(extra: [String: String] = [:]) -> [String: String] {
+        var env = AgentSession.shellEnvironment ?? ProcessInfo.processInfo.environment
+        let home = FileManager.default.homeDirectoryForCurrentUser.path
+        let essentialPaths = [
+            "\(home)/.local/bin",
+            "\(home)/.local/share/claude/versions",
+            "/usr/local/bin",
+            "/opt/homebrew/bin"
+        ]
+        let currentPath = env["PATH"] ?? "/usr/bin:/bin"
+        let missingPaths = essentialPaths.filter { !currentPath.contains($0) }
+        if !missingPaths.isEmpty {
+            env["PATH"] = (missingPaths + [currentPath]).joined(separator: ":")
+        }
+        env["TERM"] = "dumb"
+        extra.forEach { env[$0.key] = $0.value }
+        return env
+    }
+
+    private func handleError(_ message: String) {
+        let trimmed = message.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !trimmed.isEmpty else { return }
+        onError?(trimmed)
+        history.append(Message(role: .error, text: trimmed))
+    }
+
+    private func flushPendingMessagesIfPossible() {
+        guard isRunning, isReadyForMessages, !isBusy, !pendingMessages.isEmpty else { return }
+        let next = pendingMessages.removeFirst()
+        send(message: next)
+    }
 }
+
+typealias ClaudeSession = AgentSession

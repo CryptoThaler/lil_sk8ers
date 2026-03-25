@@ -4,14 +4,14 @@
 
 Tiny AI companions that live on your macOS dock.
 
-**Bruce** and **Jazz** walk back and forth above your dock. Click one to open a Claude AI terminal. They walk, they think, they vibe.
+**AXO** and **Mudbug** cruise back and forth above your dock on skateboards. Click one to open a dockside AI terminal. They skate, they think, they vibe.
 
 ## features
 
-- Animated characters rendered from transparent HEVC video
-- Click a character to chat with Claude AI in a themed popover terminal
+- Animated characters rendered from transparent video loops
+- Click a character to chat with Claude Code or OpenAI (Codex) in a themed popover terminal
 - Four visual themes: Peach, Midnight, Cloud, Moss
-- Thinking bubbles with playful phrases while Claude works
+- Thinking bubbles with playful phrases while your assistant works
 - Sound effects on completion
 - First-run onboarding with a friendly welcome
 - Auto-updates via Sparkle
@@ -19,7 +19,7 @@ Tiny AI companions that live on your macOS dock.
 ## requirements
 
 - macOS Sonoma (14.0+)
-- [Claude Code CLI](https://claude.ai/download)
+- [Claude Code CLI](https://claude.ai/download) or a local `codex` CLI install
 
 ## building
 
@@ -30,7 +30,7 @@ Open `lil-agents.xcodeproj` in Xcode and hit run.
 lil agents runs entirely on your Mac and sends no personal data anywhere.
 
 - **Your data stays local.** The app plays bundled animations and calculates your dock size to position the characters. No project data, file paths, or personal information is collected or transmitted.
-- **Claude AI.** Conversations are handled entirely by the Claude Code CLI process running locally. lil agents does not intercept, store, or transmit your chat content. Any data sent to Anthropic is governed by their terms and privacy policy.
+- **AI providers.** Conversations are handled by the local CLI you select from the menu bar. lil agents does not intercept, store, or transmit your chat content beyond handing it to the provider CLI you choose. Any data sent upstream is governed by that provider's terms and privacy policy.
 - **No accounts.** No login, no user database, no analytics in the app.
 - **Updates.** lil agents uses Sparkle to check for updates, which sends your app version and macOS version. Nothing else.
 

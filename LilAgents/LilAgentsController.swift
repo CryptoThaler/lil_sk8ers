@@ -23,8 +23,8 @@ class LilAgentsController {
         char2.walkAmountRange = 0.35...0.6
         char1.yOffset = -3
         char2.yOffset = -7
-        char1.characterColor = NSColor(red: 0.4, green: 0.72, blue: 0.55, alpha: 1.0)
-        char2.characterColor = NSColor(red: 1.0, green: 0.4, blue: 0.0, alpha: 1.0)
+        char1.characterColor = NSColor(red: 0.38, green: 0.80, blue: 0.68, alpha: 1.0)
+        char2.characterColor = NSColor(red: 0.90, green: 0.37, blue: 0.24, alpha: 1.0)
 
         char1.flipXOffset = 0
         char2.flipXOffset = -9
@@ -50,15 +50,15 @@ class LilAgentsController {
     }
 
     private func triggerOnboarding() {
-        guard let bruce = characters.first else { return }
-        bruce.isOnboarding = true
+        guard let axo = characters.first else { return }
+        axo.isOnboarding = true
         // Show "hi!" bubble after a short delay so the character is visible first
         DispatchQueue.main.asyncAfter(deadline: .now() + 2.0) {
-            bruce.currentPhrase = "hi!"
-            bruce.showingCompletion = true
-            bruce.completionBubbleExpiry = CACurrentMediaTime() + 600 // stays until clicked
-            bruce.showBubble(text: "hi!", isCompletion: true)
-            bruce.playCompletionSound()
+            axo.currentPhrase = "hi!"
+            axo.showingCompletion = true
+            axo.completionBubbleExpiry = CACurrentMediaTime() + 600 // stays until clicked
+            axo.showBubble(text: "hi!", isCompletion: true)
+            axo.playCompletionSound()
         }
     }
 
