@@ -3,7 +3,7 @@ import AppKit
 import Sparkle
 
 @main
-struct LilAgentsApp: App {
+struct LilSk8ersApp: App {
     @NSApplicationDelegateAdaptor(AppDelegate.self) var appDelegate
 
     var body: some Scene {
@@ -12,13 +12,13 @@ struct LilAgentsApp: App {
 }
 
 class AppDelegate: NSObject, NSApplicationDelegate {
-    var controller: LilAgentsController?
+    var controller: LilSk8ersController?
     var statusItem: NSStatusItem?
     let updaterController = SPUStandardUpdaterController(startingUpdater: true, updaterDelegate: nil, userDriverDelegate: nil)
 
     func applicationDidFinishLaunching(_ notification: Notification) {
         NSApp.setActivationPolicy(.accessory)
-        controller = LilAgentsController()
+        controller = LilSk8ersController()
         controller?.start()
         setupMenuBar()
     }
@@ -32,7 +32,7 @@ class AppDelegate: NSObject, NSApplicationDelegate {
     func setupMenuBar() {
         statusItem = NSStatusBar.system.statusItem(withLength: NSStatusItem.squareLength)
         if let button = statusItem?.button {
-            button.image = NSImage(named: "MenuBarIcon") ?? NSImage(systemSymbolName: "figure.walk", accessibilityDescription: "lil agents")
+            button.image = NSImage(named: "MenuBarIcon") ?? NSImage(systemSymbolName: "figure.walk", accessibilityDescription: "lil_sk8ers")
         }
 
         let menu = NSMenu()

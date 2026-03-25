@@ -1,7 +1,7 @@
 import AVFoundation
 import AppKit
 
-class WalkerCharacter {
+class WalkerCharacter: NSObject {
     let videoName: String
     var window: NSWindow!
     var playerLayer: AVPlayerLayer!
@@ -50,14 +50,18 @@ class WalkerCharacter {
     var clickOutsideMonitor: Any?
     var escapeKeyMonitor: Any?
     var currentStreamingText = ""
-    weak var controller: LilAgentsController?
+    weak var controller: LilSk8ersController?
     var themeOverride: PopoverTheme?
     var isClaudeBusy: Bool { claudeSession?.isBusy ?? false }
     var thinkingBubbleWindow: NSWindow?
     var activeProvider: AgentProvider { AgentProvider.current }
+    var usageLabel: NSTextField?
+    var resetButton: NSButton?
+    private var lastUsageRefresh: CFTimeInterval = 0
 
     init(videoName: String) {
         self.videoName = videoName
+        super.init()
     }
 
     // MARK: - Setup
@@ -214,6 +218,7 @@ class WalkerCharacter {
             terminal.replayHistory(session.history)
         }
 
+        updateUsageDisplay(force: true)
         updatePopoverPosition()
         popoverWindow?.orderFrontRegardless()
         popoverWindow?.makeKey()
@@ -288,6 +293,8 @@ class WalkerCharacter {
         let t = resolvedTheme
         let popoverWidth: CGFloat = 420
         let popoverHeight: CGFloat = 310
+        let titleBarHeight: CGFloat = 28
+        let statsBarHeight: CGFloat = 24
 
         let win = KeyableWindow(
             contentRect: CGRect(x: 0, y: 0, width: popoverWidth, height: popoverHeight),
@@ -312,7 +319,7 @@ class WalkerCharacter {
         container.layer?.borderColor = t.popoverBorder.cgColor
         container.autoresizingMask = [.width, .height]
 
-        let titleBar = NSView(frame: NSRect(x: 0, y: popoverHeight - 28, width: popoverWidth, height: 28))
+        let titleBar = NSView(frame: NSRect(x: 0, y: popoverHeight - titleBarHeight, width: popoverWidth, height: titleBarHeight))
         titleBar.wantsLayer = true
         titleBar.layer?.backgroundColor = t.titleBarBg.cgColor
         container.addSubview(titleBar)
@@ -330,12 +337,33 @@ class WalkerCharacter {
         providerLabel.frame = NSRect(x: popoverWidth - 120, y: 6, width: 104, height: 16)
         titleBar.addSubview(providerLabel)
 
-        let sep = NSView(frame: NSRect(x: 0, y: popoverHeight - 29, width: popoverWidth, height: 1))
+        let statsBarY = popoverHeight - titleBarHeight - statsBarHeight
+        let statsBar = NSView(frame: NSRect(x: 0, y: statsBarY, width: popoverWidth, height: statsBarHeight))
+        statsBar.wantsLayer = true
+        statsBar.layer?.backgroundColor = t.titleBarBg.withAlphaComponent(0.45).cgColor
+        container.addSubview(statsBar)
+
+        let usageLabel = NSTextField(labelWithString: "")
+        usageLabel.font = NSFont.monospacedSystemFont(ofSize: 9, weight: .medium)
+        usageLabel.textColor = t.textDim
+        usageLabel.frame = NSRect(x: 12, y: 5, width: popoverWidth - 88, height: 14)
+        statsBar.addSubview(usageLabel)
+        self.usageLabel = usageLabel
+
+        let resetButton = NSButton(title: "Reset", target: self, action: #selector(resetSessionFromButton))
+        resetButton.isBordered = false
+        resetButton.font = NSFont.monospacedSystemFont(ofSize: 9, weight: .semibold)
+        resetButton.contentTintColor = t.accentColor
+        resetButton.frame = NSRect(x: popoverWidth - 64, y: 3, width: 52, height: 18)
+        statsBar.addSubview(resetButton)
+        self.resetButton = resetButton
+
+        let sep = NSView(frame: NSRect(x: 0, y: statsBarY - 1, width: popoverWidth, height: 1))
         sep.wantsLayer = true
         sep.layer?.backgroundColor = t.separatorColor.cgColor
         container.addSubview(sep)
 
-        let terminal = TerminalView(frame: NSRect(x: 0, y: 0, width: popoverWidth, height: popoverHeight - 29))
+        let terminal = TerminalView(frame: NSRect(x: 0, y: 0, width: popoverWidth, height: statsBarY - 1))
         terminal.characterColor = characterColor
         terminal.themeOverride = themeOverride
         terminal.placeholderText = activeProvider.placeholder
@@ -348,37 +376,48 @@ class WalkerCharacter {
         win.contentView = container
         popoverWindow = win
         terminalView = terminal
+        updateUsageDisplay(force: true)
     }
 
     private func wireSession(_ session: ClaudeSession) {
         session.onText = { [weak self] text in
-            self?.currentStreamingText += text
-            self?.terminalView?.appendStreamingText(text)
+            guard let self = self, self.claudeSession === session else { return }
+            self.currentStreamingText += text
+            self.terminalView?.appendStreamingText(text)
         }
 
         session.onTurnComplete = { [weak self] in
-            self?.terminalView?.endStreaming()
-            self?.playCompletionSound()
-            self?.showCompletionBubble()
+            guard let self = self, self.claudeSession === session else { return }
+            self.terminalView?.endStreaming()
+            self.playCompletionSound()
+            self.showCompletionBubble()
         }
 
         session.onError = { [weak self] text in
-            self?.terminalView?.appendError(text)
+            guard let self = self, self.claudeSession === session else { return }
+            self.terminalView?.appendError(text)
         }
 
         session.onToolUse = { [weak self] toolName, input in
-            guard let self = self else { return }
+            guard let self = self, self.claudeSession === session else { return }
             let summary = self.formatToolInput(input)
             self.terminalView?.appendToolUse(toolName: toolName, summary: summary)
         }
 
         session.onToolResult = { [weak self] summary, isError in
-            self?.terminalView?.appendToolResult(summary: summary, isError: isError)
+            guard let self = self, self.claudeSession === session else { return }
+            self.terminalView?.appendToolResult(summary: summary, isError: isError)
         }
 
         session.onProcessExit = { [weak self] in
-            self?.terminalView?.endStreaming()
-            self?.terminalView?.appendError("\(session.provider.menuTitle) session ended.")
+            guard let self = self, self.claudeSession === session else { return }
+            self.terminalView?.endStreaming()
+            self.terminalView?.appendError("\(session.provider.menuTitle) session ended.")
+        }
+
+        session.onUsageChanged = { [weak self] _ in
+            guard let self = self, self.claudeSession === session else { return }
+            self.updateUsageDisplay(force: true)
         }
     }
 
@@ -390,20 +429,12 @@ class WalkerCharacter {
         guard isIdleForPopover else {
             popoverWindow = nil
             terminalView = nil
+            usageLabel = nil
+            resetButton = nil
             return
         }
 
-        popoverWindow?.orderOut(nil)
-        popoverWindow = nil
-        terminalView = nil
-        createPopoverWindow()
-        updatePopoverPosition()
-        popoverWindow?.orderFrontRegardless()
-        popoverWindow?.makeKey()
-
-        if let terminal = terminalView {
-            popoverWindow?.makeFirstResponder(terminal.inputField)
-        }
+        rebuildPopover(startSession: true)
     }
 
     private func formatToolInput(_ input: [String: Any]) -> String {
@@ -427,6 +458,105 @@ class WalkerCharacter {
         let clampedY = min(y, screenFrame.maxY - popoverSize.height - 4)
 
         popover.setFrameOrigin(NSPoint(x: x, y: clampedY))
+    }
+
+    private func rebuildPopover(startSession: Bool, statusMessage: String? = nil) {
+        popoverWindow?.orderOut(nil)
+        popoverWindow = nil
+        terminalView = nil
+        usageLabel = nil
+        resetButton = nil
+        lastUsageRefresh = 0
+
+        if startSession {
+            let session = ClaudeSession(provider: activeProvider)
+            claudeSession = session
+            wireSession(session)
+            session.start()
+        }
+
+        createPopoverWindow()
+        updatePopoverPosition()
+        popoverWindow?.orderFrontRegardless()
+        popoverWindow?.makeKey()
+
+        if let terminal = terminalView {
+            if let statusMessage, !statusMessage.isEmpty {
+                terminal.appendStatus(statusMessage)
+            }
+            popoverWindow?.makeFirstResponder(terminal.inputField)
+        }
+    }
+
+    @objc private func resetSessionFromButton() {
+        claudeSession?.resetConversation()
+        claudeSession = nil
+        currentStreamingText = ""
+        guard isIdleForPopover else { return }
+        rebuildPopover(startSession: true, statusMessage: "session reset. context cleared.")
+    }
+
+    private func updateUsageDisplay(force: Bool = false) {
+        let now = CACurrentMediaTime()
+        guard force || now - lastUsageRefresh >= 0.25 else { return }
+        lastUsageRefresh = now
+
+        guard let usageLabel = usageLabel else { return }
+        guard let session = claudeSession else {
+            usageLabel.stringValue = "idle | send a message to start usage tracking"
+            resetButton?.isEnabled = false
+            resetButton?.alphaValue = 0.45
+            return
+        }
+
+        let snapshot = session.usageSnapshot
+        usageLabel.stringValue = formatUsage(snapshot)
+        let canReset = session.isRunning || session.isBusy || !session.history.isEmpty
+        resetButton?.isEnabled = canReset
+        resetButton?.alphaValue = canReset ? 1.0 : 0.45
+    }
+
+    private func formatUsage(_ snapshot: ClaudeSession.UsageSnapshot) -> String {
+        let inputTokens = snapshot.isBusy ? snapshot.currentTurnInputTokens : snapshot.lastTurnInputTokens
+        let outputTokens = snapshot.isBusy ? snapshot.currentTurnOutputTokens : snapshot.lastTurnOutputTokens
+        let contextPercent = Int((snapshot.estimatedContextPercent * 100).rounded())
+        let turnTiming: String
+        if snapshot.isBusy, let live = snapshot.liveTurnDuration {
+            turnTiming = "live \(formatDuration(live))"
+        } else if let last = snapshot.lastTurnDuration {
+            turnTiming = "last \(formatDuration(last))"
+        } else {
+            turnTiming = "ready"
+        }
+
+        let prefix = snapshot.provider == .openAICodex ? "codex" : "claude"
+        return "\(prefix) io ~\(formatTokens(inputTokens))/\(formatTokens(outputTokens)) | ctx ~\(formatTokens(snapshot.estimatedContextTokens))/\(formatTokens(snapshot.contextBudgetTokens)) \(contextPercent)% | \(turnTiming) | reset \(formatDuration(snapshot.sessionAge))"
+    }
+
+    private func formatTokens(_ value: Int) -> String {
+        guard value > 0 else { return "0" }
+        if value >= 1_000_000 {
+            return String(format: "%.1fm", Double(value) / 1_000_000.0)
+        }
+        if value >= 1_000 {
+            return String(format: "%.1fk", Double(value) / 1_000.0)
+        }
+        return "\(value)"
+    }
+
+    private func formatDuration(_ interval: TimeInterval) -> String {
+        let seconds = max(Int(interval.rounded()), 0)
+        if seconds < 60 {
+            return "\(seconds)s"
+        }
+        let minutes = seconds / 60
+        let remainingSeconds = seconds % 60
+        if minutes < 60 {
+            return remainingSeconds == 0 ? "\(minutes)m" : "\(minutes)m\(remainingSeconds)s"
+        }
+        let hours = minutes / 60
+        let remainingMinutes = minutes % 60
+        return remainingMinutes == 0 ? "\(hours)h" : "\(hours)h\(remainingMinutes)m"
     }
 
     // MARK: - Thinking Bubble
@@ -755,6 +885,7 @@ class WalkerCharacter {
             let y = dockTopY - bottomPadding + yOffset
             window.setFrameOrigin(NSPoint(x: x, y: y))
             updatePopoverPosition()
+            updateUsageDisplay()
             updateThinkingBubble()
             return
         }

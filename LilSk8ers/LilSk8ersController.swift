@@ -1,6 +1,6 @@
 import AppKit
 
-class LilAgentsController {
+class LilSk8ersController {
     var characters: [WalkerCharacter] = []
     private var displayLink: CVDisplayLink?
     var debugWindow: NSWindow?
@@ -134,7 +134,7 @@ class LilAgentsController {
         guard let displayLink = displayLink else { return }
 
         let callback: CVDisplayLinkOutputCallback = { _, _, _, _, _, userInfo -> CVReturn in
-            let controller = Unmanaged<LilAgentsController>.fromOpaque(userInfo!).takeUnretainedValue()
+            let controller = Unmanaged<LilSk8ersController>.fromOpaque(userInfo!).takeUnretainedValue()
             DispatchQueue.main.async {
                 controller.tick()
             }

@@ -21,7 +21,7 @@ struct CharacterPalette {
 }
 
 let repoRoot = URL(fileURLWithPath: FileManager.default.currentDirectoryPath)
-let appRoot = repoRoot.appendingPathComponent("LilAgents", isDirectory: true)
+let appRoot = repoRoot.appendingPathComponent("LilSk8ers", isDirectory: true)
 let size = CGSize(width: 1080, height: 1920)
 let fps: Int32 = 24
 let duration = 10.0

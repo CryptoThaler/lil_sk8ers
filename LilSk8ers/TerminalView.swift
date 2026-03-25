@@ -214,6 +214,14 @@ class TerminalView: NSView {
         scrollToBottom()
     }
 
+    func appendStatus(_ text: String) {
+        let t = theme
+        textView.textStorage?.append(NSAttributedString(string: text + "\n", attributes: [
+            .font: t.font, .foregroundColor: t.textDim
+        ]))
+        scrollToBottom()
+    }
+
     func appendToolUse(toolName: String, summary: String) {
         let t = theme
         endStreaming()
@@ -266,6 +274,12 @@ class TerminalView: NSView {
             }
         }
         scrollToBottom()
+    }
+
+    func clearTranscript() {
+        textView.textStorage?.setAttributedString(NSAttributedString(string: ""))
+        currentAssistantText = ""
+        isStreaming = false
     }
 
     private func scrollToBottom() {

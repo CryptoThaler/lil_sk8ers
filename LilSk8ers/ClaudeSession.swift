@@ -5,6 +5,7 @@ enum AgentProvider: String, CaseIterable {
     case openAICodex = "openai_codex"
 
     static let defaultsKey = "selectedProvider"
+    static let softTokenBudget = 100_000
 
     var menuTitle: String {
         switch self {
@@ -99,6 +100,8 @@ enum AgentProvider: String, CaseIterable {
         }
     }
 
+    var usageBudgetTokens: Int { Self.softTokenBudget }
+
     static var current: AgentProvider {
         guard let raw = UserDefaults.standard.string(forKey: defaultsKey),
               let provider = AgentProvider(rawValue: raw) else {
@@ -113,6 +116,25 @@ enum AgentProvider: String, CaseIterable {
 }
 
 final class AgentSession {
+    struct UsageSnapshot {
+        let provider: AgentProvider
+        let sessionAge: TimeInterval
+        let completedTurns: Int
+        let estimatedContextTokens: Int
+        let contextBudgetTokens: Int
+        let estimatedContextPercent: Double
+        let lastTurnDuration: TimeInterval?
+        let liveTurnDuration: TimeInterval?
+        let lastTurnInputTokens: Int
+        let lastTurnOutputTokens: Int
+        let currentTurnInputTokens: Int
+        let currentTurnOutputTokens: Int
+        let totalInputTokens: Int
+        let totalOutputTokens: Int
+        let isBusy: Bool
+        let pendingMessages: Int
+    }
+
     private var process: Process?
     private var inputPipe: Pipe?
     private var outputPipe: Pipe?
@@ -125,6 +147,17 @@ final class AgentSession {
     private(set) var isBusy = false
     private var isStarting = false
     private var isReadyForMessages = false
+    private var sessionResetAt = Date()
+    private var currentTurnStartedAt: Date?
+    private var currentAssistantTurnText = ""
+    private var currentTurnInputTokens = 0
+    private var currentTurnOutputTokens = 0
+    private var lastTurnInputTokens = 0
+    private var lastTurnOutputTokens = 0
+    private var lastTurnDuration: TimeInterval?
+    private var totalInputTokens = 0
+    private var totalOutputTokens = 0
+    private var completedTurns = 0
 
     static private var resolvedPaths: [AgentProvider: String] = [:]
     static private var shellEnvironment: [String: String]?
@@ -138,6 +171,7 @@ final class AgentSession {
     var onSessionReady: (() -> Void)?
     var onTurnComplete: (() -> Void)?
     var onProcessExit: (() -> Void)?
+    var onUsageChanged: ((UsageSnapshot) -> Void)?
 
     struct Message {
         enum Role { case user, assistant, error, toolUse, toolResult }
@@ -148,6 +182,10 @@ final class AgentSession {
 
     init(provider: AgentProvider = AgentProvider.current) {
         self.provider = provider
+    }
+
+    var usageSnapshot: UsageSnapshot {
+        makeUsageSnapshot()
     }
 
     // MARK: - Process Lifecycle
@@ -224,6 +262,7 @@ final class AgentSession {
     func start() {
         guard !isRunning, !isStarting else { return }
         isStarting = true
+        notifyUsageChanged()
 
         AgentSession.resolveCLIPath(for: provider) { [weak self] path in
             guard let self = self else { return }
@@ -232,6 +271,7 @@ final class AgentSession {
             guard let cliPath = path else {
                 self.pendingMessages.removeAll()
                 self.handleError(self.provider.missingInstallMessage)
+                self.notifyUsageChanged()
                 return
             }
 
@@ -244,6 +284,7 @@ final class AgentSession {
                 self.isRunning = true
                 self.isReadyForMessages = true
                 self.onSessionReady?()
+                self.notifyUsageChanged()
                 self.flushPendingMessagesIfPossible()
             }
         }
@@ -274,6 +315,7 @@ final class AgentSession {
                 self?.isRunning = false
                 self?.isBusy = false
                 self?.isReadyForMessages = false
+                self?.notifyUsageChanged()
                 self?.onProcessExit?()
             }
         }
@@ -305,6 +347,7 @@ final class AgentSession {
             outputPipe = outPipe
             errorPipe = errPipe
             isRunning = true
+            notifyUsageChanged()
         } catch {
             let msg = "\(provider.launchFailureMessage)\n\nError: \(error.localizedDescription)"
             handleError(msg)
@@ -325,6 +368,11 @@ final class AgentSession {
 
         isBusy = true
         history.append(Message(role: .user, text: trimmed))
+        currentTurnStartedAt = Date()
+        currentAssistantTurnText = ""
+        currentTurnInputTokens = currentContextTokenEstimate()
+        currentTurnOutputTokens = 0
+        notifyUsageChanged()
 
         switch provider {
         case .claudeCode:
@@ -338,6 +386,7 @@ final class AgentSession {
         guard let pipe = inputPipe else {
             isBusy = false
             pendingMessages.insert(message, at: 0)
+            notifyUsageChanged()
             return
         }
 
@@ -352,6 +401,7 @@ final class AgentSession {
         guard let data = try? JSONSerialization.data(withJSONObject: payload),
               let jsonStr = String(data: data, encoding: .utf8) else {
             isBusy = false
+            notifyUsageChanged()
             return
         }
 
@@ -366,7 +416,7 @@ final class AgentSession {
         }
 
         codexStderr = ""
-        let outputURL = FileManager.default.temporaryDirectory.appendingPathComponent("lil-agents-codex-\(UUID().uuidString).txt")
+        let outputURL = FileManager.default.temporaryDirectory.appendingPathComponent("lil-sk8ers-codex-\(UUID().uuidString).txt")
         let proc = Process()
         proc.executableURL = URL(fileURLWithPath: cliPath)
         proc.arguments = [
@@ -411,6 +461,7 @@ final class AgentSession {
             process = proc
             outputPipe = outPipe
             errorPipe = errPipe
+            notifyUsageChanged()
         } catch {
             isBusy = false
             let msg = "\(provider.launchFailureMessage)\n\nError: \(error.localizedDescription)"
@@ -446,17 +497,20 @@ final class AgentSession {
         process = nil
         outputPipe = nil
         errorPipe = nil
-        isBusy = false
 
         let result = (try? String(contentsOf: outputURL, encoding: .utf8))?
             .trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
         try? FileManager.default.removeItem(at: outputURL)
 
         if exitCode == 0, !result.isEmpty {
+            currentAssistantTurnText = result
+            currentTurnOutputTokens = approximateTokenCount(result)
             onText?(result)
             history.append(Message(role: .assistant, text: result))
+            completeCurrentTurn()
             onTurnComplete?()
         } else {
+            failCurrentTurn()
             let stderr = codexStderr
                 .components(separatedBy: .newlines)
                 .filter { !$0.trimmingCharacters(in: .whitespaces).isEmpty && !$0.hasPrefix("WARNING: proceeding") }
@@ -470,11 +524,36 @@ final class AgentSession {
 
     func terminate() {
         pendingMessages.removeAll()
+        outputPipe?.fileHandleForReading.readabilityHandler = nil
+        errorPipe?.fileHandleForReading.readabilityHandler = nil
         process?.terminate()
         process = nil
+        inputPipe = nil
+        outputPipe = nil
+        errorPipe = nil
         isRunning = false
         isBusy = false
         isReadyForMessages = false
+        currentTurnStartedAt = nil
+        currentAssistantTurnText = ""
+        currentTurnInputTokens = 0
+        currentTurnOutputTokens = 0
+        notifyUsageChanged()
+    }
+
+    func resetConversation() {
+        terminate()
+        history.removeAll()
+        lineBuffer = ""
+        codexStderr = ""
+        sessionResetAt = Date()
+        lastTurnDuration = nil
+        lastTurnInputTokens = 0
+        lastTurnOutputTokens = 0
+        totalInputTokens = 0
+        totalOutputTokens = 0
+        completedTurns = 0
+        notifyUsageChanged()
     }
 
     // MARK: - Claude NDJSON Parsing
@@ -502,6 +581,7 @@ final class AgentSession {
             if subtype == "init" {
                 isReadyForMessages = true
                 onSessionReady?()
+                notifyUsageChanged()
                 flushPendingMessagesIfPossible()
             }
 
@@ -511,6 +591,8 @@ final class AgentSession {
                 for block in content {
                     let blockType = block["type"] as? String ?? ""
                     if blockType == "text", let text = block["text"] as? String {
+                        currentAssistantTurnText += text
+                        currentTurnOutputTokens = approximateTokenCount(currentAssistantTurnText)
                         onText?(text)
                     } else if blockType == "tool_use" {
                         let toolName = block["name"] as? String ?? "Tool"
@@ -520,6 +602,7 @@ final class AgentSession {
                         onToolUse?(toolName, input)
                     }
                 }
+                notifyUsageChanged()
             }
 
         case "user":
@@ -545,13 +628,19 @@ final class AgentSession {
                     history.append(Message(role: .toolResult, text: isError ? "ERROR: \(summary)" : summary))
                     onToolResult?(summary, isError)
                 }
+                notifyUsageChanged()
             }
 
         case "result":
-            isBusy = false
-            if let result = json["result"] as? String, !result.isEmpty {
-                history.append(Message(role: .assistant, text: result))
+            let result = (json["result"] as? String)?
+                .trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
+            let finalAssistantText = result.isEmpty
+                ? currentAssistantTurnText.trimmingCharacters(in: .whitespacesAndNewlines)
+                : result
+            if !finalAssistantText.isEmpty {
+                history.append(Message(role: .assistant, text: finalAssistantText))
             }
+            completeCurrentTurn()
             onTurnComplete?()
             flushPendingMessagesIfPossible()
 
@@ -602,12 +691,105 @@ final class AgentSession {
         guard !trimmed.isEmpty else { return }
         onError?(trimmed)
         history.append(Message(role: .error, text: trimmed))
+        notifyUsageChanged()
     }
 
     private func flushPendingMessagesIfPossible() {
         guard isRunning, isReadyForMessages, !isBusy, !pendingMessages.isEmpty else { return }
         let next = pendingMessages.removeFirst()
+        notifyUsageChanged()
         send(message: next)
+    }
+
+    private func completeCurrentTurn() {
+        isBusy = false
+        if let startedAt = currentTurnStartedAt {
+            lastTurnDuration = Date().timeIntervalSince(startedAt)
+        }
+        lastTurnInputTokens = currentTurnInputTokens
+        lastTurnOutputTokens = currentTurnOutputTokens
+        totalInputTokens += currentTurnInputTokens
+        totalOutputTokens += currentTurnOutputTokens
+        completedTurns += 1
+        currentTurnStartedAt = nil
+        currentTurnInputTokens = 0
+        currentTurnOutputTokens = 0
+        currentAssistantTurnText = ""
+        notifyUsageChanged()
+    }
+
+    private func failCurrentTurn() {
+        isBusy = false
+        if let startedAt = currentTurnStartedAt {
+            lastTurnDuration = Date().timeIntervalSince(startedAt)
+        }
+        currentTurnStartedAt = nil
+        currentTurnInputTokens = 0
+        currentTurnOutputTokens = 0
+        currentAssistantTurnText = ""
+        notifyUsageChanged()
+    }
+
+    private func notifyUsageChanged() {
+        onUsageChanged?(makeUsageSnapshot())
+    }
+
+    private func makeUsageSnapshot(referenceDate: Date = Date()) -> UsageSnapshot {
+        let estimatedContextTokens = currentContextTokenEstimate()
+        let budget = provider.usageBudgetTokens
+        let percent = budget > 0 ? Double(estimatedContextTokens) / Double(budget) : 0
+        let liveTurnDuration = currentTurnStartedAt.map { referenceDate.timeIntervalSince($0) }
+
+        return UsageSnapshot(
+            provider: provider,
+            sessionAge: referenceDate.timeIntervalSince(sessionResetAt),
+            completedTurns: completedTurns,
+            estimatedContextTokens: estimatedContextTokens,
+            contextBudgetTokens: budget,
+            estimatedContextPercent: percent,
+            lastTurnDuration: lastTurnDuration,
+            liveTurnDuration: liveTurnDuration,
+            lastTurnInputTokens: lastTurnInputTokens,
+            lastTurnOutputTokens: lastTurnOutputTokens,
+            currentTurnInputTokens: currentTurnInputTokens,
+            currentTurnOutputTokens: currentTurnOutputTokens,
+            totalInputTokens: totalInputTokens,
+            totalOutputTokens: totalOutputTokens,
+            isBusy: isBusy,
+            pendingMessages: pendingMessages.count
+        )
+    }
+
+    private func currentContextTokenEstimate() -> Int {
+        switch provider {
+        case .openAICodex:
+            return approximateTokenCount(buildCodexPrompt())
+        case .claudeCode:
+            return approximateTokenCount(buildUsageTranscript())
+        }
+    }
+
+    private func buildUsageTranscript() -> String {
+        history.map { message in
+            switch message.role {
+            case .user:
+                return "USER: \(message.text)"
+            case .assistant:
+                return "ASSISTANT: \(message.text)"
+            case .error:
+                return "SYSTEM: \(message.text)"
+            case .toolUse:
+                return "TOOL: \(message.text)"
+            case .toolResult:
+                return "RESULT: \(message.text)"
+            }
+        }.joined(separator: "\n\n")
+    }
+
+    private func approximateTokenCount(_ text: String) -> Int {
+        let trimmed = text.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !trimmed.isEmpty else { return 0 }
+        return max(1, Int(ceil(Double(trimmed.count) / 4.0)))
     }
 }
 
